@@ -217,7 +217,7 @@ class A2CBase(BaseAlgorithm):
         self.entropy_coef = self.config['entropy_coef']
 
         if self.rank == 0:
-            writer = SummaryWriter(self.summaries_dir)
+            writer = SummaryWriter("runs/this_is_a_test_directory")
             if self.population_based_training:
                 self.writer = IntervalSummaryWriter(writer, self.config)
             else:
@@ -905,82 +905,96 @@ class DiscreteA2CBase(A2CBase):
         # self.frame = 0  # loading from checkpoint
         self.obs = self.env_reset()
 
-        if self.multi_gpu:
-            self.hvd.setup_algo(self)
+        # if self.multi_gpu:
+        #     self.hvd.setup_algo(self)
 
-        while True:
-            epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
-            # if self.multi_gpu:
-            #     self.hvd.sync_stats(self)
-            # cleaning memory to optimize space
-            self.dataset.update_values_dict(None)
-            total_time += sum_time
-            curr_frames = self.curr_frames * self.rank_size if self.multi_gpu else self.curr_frames
-            self.frame += curr_frames
-            should_exit = False
-            if self.rank == 0:
-                self.diagnostics.epoch(self, current_epoch=epoch_num)
-                scaled_time = self.num_agents * sum_time
-                scaled_play_time = self.num_agents * play_time
+        with torch.profiler.profile(
+            schedule=torch.profiler.schedule(
+                skip_first=1,
+                wait=1,
+                warmup=1,
+                active=10,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"runs/this_is_a_test_directory"),
+            # profile_memory=True,
+            # with_stack=True,
+        ) as prof:
 
-                frame = self.frame // self.num_agents
+            while True:
+                epoch_num = self.update_epoch()
+                step_time, play_time, update_time, sum_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+                # if self.multi_gpu:
+                #     self.hvd.sync_stats(self)
+                # cleaning memory to optimize space
+                self.dataset.update_values_dict(None)
+                total_time += sum_time
+                curr_frames = self.curr_frames * self.rank_size if self.multi_gpu else self.curr_frames
+                self.frame += curr_frames
+                should_exit = False
+                if self.rank == 0:
+                    self.diagnostics.epoch(self, current_epoch=epoch_num)
+                    scaled_time = self.num_agents * sum_time
+                    scaled_play_time = self.num_agents * play_time
 
-                if self.print_stats:
-                    fps_step = curr_frames / step_time
-                    fps_step_inference = curr_frames / scaled_play_time
-                    fps_total = curr_frames / scaled_time
-                    print(f'fps step: {fps_step:.1f} fps step and policy inference: {fps_step_inference:.1f}  fps total: {fps_total:.1f} epoch: {epoch_num}/{self.max_epochs}')
+                    frame = self.frame // self.num_agents
 
-                self.write_stats(total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames)
+                    if self.print_stats:
+                        fps_step = curr_frames / step_time
+                        fps_step_inference = curr_frames / scaled_play_time
+                        fps_total = curr_frames / scaled_time
+                        print(f'fps step: {fps_step:.1f} fps step and policy inference: {fps_step_inference:.1f}  fps total: {fps_total:.1f} epoch: {epoch_num}/{self.max_epochs}')
 
-                self.algo_observer.after_print_stats(frame, epoch_num, total_time)
+                    self.write_stats(total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames)
 
-                if self.game_rewards.current_size > 0:
-                    mean_rewards = self.game_rewards.get_mean()
-                    mean_lengths = self.game_lengths.get_mean()
-                    self.mean_rewards = mean_rewards[0]
+                    self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
-                    for i in range(self.value_size):
-                        rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
-                        self.writer.add_scalar(rewards_name + '/step'.format(i), mean_rewards[i], frame)
-                        self.writer.add_scalar(rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
-                        self.writer.add_scalar(rewards_name + '/time'.format(i), mean_rewards[i], total_time)
+                    if self.game_rewards.current_size > 0:
+                        mean_rewards = self.game_rewards.get_mean()
+                        mean_lengths = self.game_lengths.get_mean()
+                        self.mean_rewards = mean_rewards[0]
 
-                    self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
-                    self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
-                    self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
+                        for i in range(self.value_size):
+                            rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
+                            self.writer.add_scalar(rewards_name + '/step'.format(i), mean_rewards[i], frame)
+                            self.writer.add_scalar(rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
+                            self.writer.add_scalar(rewards_name + '/time'.format(i), mean_rewards[i], total_time)
 
-                    if self.has_self_play_config:
-                        self.self_play_manager.update(self)
+                        self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
+                        self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
+                        self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
 
-                    # removed equal signs (i.e. "rew=") from the checkpoint name since it messes with hydra CLI parsing
-                    checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
+                        if self.has_self_play_config:
+                            self.self_play_manager.update(self)
 
-                    if self.save_freq > 0:
-                        if (epoch_num % self.save_freq == 0) and (mean_rewards <= self.last_mean_rewards):
-                            self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+                        # removed equal signs (i.e. "rew=") from the checkpoint name since it messes with hydra CLI parsing
+                        checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
-                    if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
-                        print('saving next best rewards: ', mean_rewards)
-                        self.last_mean_rewards = mean_rewards[0]
-                        self.save(os.path.join(self.nn_dir, self.config['name']))
-                        if self.last_mean_rewards > self.config['score_to_win']:
-                            print('Network won!')
-                            self.save(os.path.join(self.nn_dir, checkpoint_name))
-                            should_exit = True
+                        if self.save_freq > 0:
+                            if (epoch_num % self.save_freq == 0) and (mean_rewards <= self.last_mean_rewards):
+                                self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
 
-                if epoch_num > self.max_epochs:
-                    self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
-                    print('MAX EPOCHS NUM!')
-                    should_exit = True                              
-                update_time = 0
-            # if self.multi_gpu:
-            #         should_exit_t = torch.tensor(should_exit).float()
-            #         self.hvd.broadcast_value(should_exit_t, 'should_exit')
-            #         should_exit = should_exit_t.bool().item()
-            if should_exit:
-                return self.last_mean_rewards, epoch_num
+                        if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
+                            print('saving next best rewards: ', mean_rewards)
+                            self.last_mean_rewards = mean_rewards[0]
+                            self.save(os.path.join(self.nn_dir, self.config['name']))
+                            if self.last_mean_rewards > self.config['score_to_win']:
+                                print('Network won!')
+                                self.save(os.path.join(self.nn_dir, checkpoint_name))
+                                should_exit = True
+
+                    if epoch_num > self.max_epochs:
+                        self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+                        print('MAX EPOCHS NUM!')
+                        should_exit = True                              
+                    update_time = 0
+                # if self.multi_gpu:
+                #         should_exit_t = torch.tensor(should_exit).float()
+                #         self.hvd.broadcast_value(should_exit_t, 'should_exit')
+                #         should_exit = should_exit_t.bool().item()
+                if should_exit:
+                    return self.last_mean_rewards, epoch_num
+
+                prof.step()
 
 
 class ContinuousA2CBase(A2CBase):
@@ -1157,82 +1171,94 @@ class ContinuousA2CBase(A2CBase):
 
         # if self.multi_gpu:
         #     self.hvd.setup_algo(self)
+        with torch.profiler.profile(
+            schedule=torch.profiler.schedule(
+                skip_first=1,
+                wait=1,
+                warmup=1,
+                active=10,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"runs/this_is_a_test_directory"),
+            # profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            while True:
+                epoch_num = self.update_epoch()
+                step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+                total_time += sum_time
+                frame = self.frame // self.num_agents
+                # if self.multi_gpu:
+                #     self.hvd.sync_stats(self)
+                # cleaning memory to optimize space
+                self.dataset.update_values_dict(None)
+                should_exit = False
+                if self.rank == 0:
+                    self.diagnostics.epoch(self, current_epoch=epoch_num)
+                    # do we need scaled_time?
+                    scaled_time = self.num_agents * sum_time
+                    scaled_play_time = self.num_agents * play_time
+                    curr_frames = self.curr_frames * self.rank_size if self.multi_gpu else self.curr_frames
+                    self.frame += curr_frames
+                    if self.print_stats:
+                        fps_step = curr_frames / step_time
+                        fps_step_inference = curr_frames / scaled_play_time
+                        fps_total = curr_frames / scaled_time
+                        print(f'fps step: {fps_step:.1f} fps step and policy inference: {fps_step_inference:.1f}  fps total: {fps_total:.1f} epoch: {epoch_num}/{self.max_epochs}')
 
-        while True:
-            epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
-            total_time += sum_time
-            frame = self.frame // self.num_agents
-            # if self.multi_gpu:
-            #     self.hvd.sync_stats(self)
-            # cleaning memory to optimize space
-            self.dataset.update_values_dict(None)
-            should_exit = False
-            if self.rank == 0:
-                self.diagnostics.epoch(self, current_epoch=epoch_num)
-                # do we need scaled_time?
-                scaled_time = self.num_agents * sum_time
-                scaled_play_time = self.num_agents * play_time
-                curr_frames = self.curr_frames * self.rank_size if self.multi_gpu else self.curr_frames
-                self.frame += curr_frames
-                if self.print_stats:
-                    fps_step = curr_frames / step_time
-                    fps_step_inference = curr_frames / scaled_play_time
-                    fps_total = curr_frames / scaled_time
-                    print(f'fps step: {fps_step:.1f} fps step and policy inference: {fps_step_inference:.1f}  fps total: {fps_total:.1f} epoch: {epoch_num}/{self.max_epochs}')
+                    self.write_stats(total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames)
+                    if len(b_losses) > 0:
+                        self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
 
-                self.write_stats(total_time, epoch_num, step_time, play_time, update_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame, scaled_time, scaled_play_time, curr_frames)
-                if len(b_losses) > 0:
-                    self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
+                    if self.has_soft_aug:
+                        self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
 
-                if self.has_soft_aug:
-                    self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
+                    
+                    if self.game_rewards.current_size > 0:
+                        mean_rewards = self.game_rewards.get_mean()
+                        mean_lengths = self.game_lengths.get_mean()
+                        self.mean_rewards = mean_rewards[0]
 
+                        for i in range(self.value_size):
+                            rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
+                            self.writer.add_scalar(rewards_name + '/step'.format(i), mean_rewards[i], frame)
+                            self.writer.add_scalar(rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
+                            self.writer.add_scalar(rewards_name + '/time'.format(i), mean_rewards[i], total_time)
+
+                        self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
+                        self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
+                        self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
+
+                        if self.has_self_play_config:
+                            self.self_play_manager.update(self)
+
+                        checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
+
+                        if self.save_freq > 0:
+                            if (epoch_num % self.save_freq == 0) and (mean_rewards[0] <= self.last_mean_rewards):
+                                self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+
+                        if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
+                            print('saving next best rewards: ', mean_rewards)
+                            self.last_mean_rewards = mean_rewards[0]
+                            self.save(os.path.join(self.nn_dir, self.config['name']))
+                            if self.last_mean_rewards > self.config['score_to_win']:
+                                print('Network won!')
+                                self.save(os.path.join(self.nn_dir, checkpoint_name))
+                                should_exit = True
+                                
+
+                    if epoch_num > self.max_epochs:
+                        self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + 'ep' + str(epoch_num) + 'rew' + str(mean_rewards)))
+                        print('MAX EPOCHS NUM!')
+                        should_exit = True
+
+                    update_time = 0
+                # if self.multi_gpu:
+                #         should_exit_t = torch.tensor(should_exit).float()
+                #         self.hvd.broadcast_value(should_exit_t, 'should_exit')
+                #         should_exit = should_exit_t.float().item()
+                if should_exit:
+                    return self.last_mean_rewards, epoch_num
                 
-                if self.game_rewards.current_size > 0:
-                    mean_rewards = self.game_rewards.get_mean()
-                    mean_lengths = self.game_lengths.get_mean()
-                    self.mean_rewards = mean_rewards[0]
-
-                    for i in range(self.value_size):
-                        rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
-                        self.writer.add_scalar(rewards_name + '/step'.format(i), mean_rewards[i], frame)
-                        self.writer.add_scalar(rewards_name + '/iter'.format(i), mean_rewards[i], epoch_num)
-                        self.writer.add_scalar(rewards_name + '/time'.format(i), mean_rewards[i], total_time)
-
-                    self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
-                    self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
-                    self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
-
-                    if self.has_self_play_config:
-                        self.self_play_manager.update(self)
-
-                    checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
-
-                    if self.save_freq > 0:
-                        if (epoch_num % self.save_freq == 0) and (mean_rewards[0] <= self.last_mean_rewards):
-                            self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
-
-                    if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
-                        print('saving next best rewards: ', mean_rewards)
-                        self.last_mean_rewards = mean_rewards[0]
-                        self.save(os.path.join(self.nn_dir, self.config['name']))
-                        if self.last_mean_rewards > self.config['score_to_win']:
-                            print('Network won!')
-                            self.save(os.path.join(self.nn_dir, checkpoint_name))
-                            should_exit = True
-                            
-
-                if epoch_num > self.max_epochs:
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + 'ep' + str(epoch_num) + 'rew' + str(mean_rewards)))
-                    print('MAX EPOCHS NUM!')
-                    should_exit = True
-
-                update_time = 0
-            # if self.multi_gpu:
-            #         should_exit_t = torch.tensor(should_exit).float()
-            #         self.hvd.broadcast_value(should_exit_t, 'should_exit')
-            #         should_exit = should_exit_t.float().item()
-            if should_exit:
-                return self.last_mean_rewards, epoch_num
+                prof.step()
 
